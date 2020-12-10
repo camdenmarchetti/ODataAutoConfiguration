@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
@@ -12,12 +13,22 @@ namespace ODataAutoConfiguration
 {
   public class AutoScaffolder<ContextType> where ContextType : DbContext
   {
+    private static MethodInfo GetPrimitivePropertyConfigurationMethod;
+
+    static AutoScaffolder()
+    {
+      // Pull the method information for the static method GetPrimitivePropertyConfiguration
+      // to allow reflection to avoid dynamic generic-runtime-parameters and Expression.Convert calls
+      GetPrimitivePropertyConfigurationMethod = typeof(AutoScaffolder<>).GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
+                                                                        .FirstOrDefault(method => method.Name == "GetPrimitivePropertyConfiguration");
+    }
+
     // Used to pluralize set names from the entity type name
     private readonly Pluralizer _pluralizer;
-    
+
     // Database context from which to source keys
     private readonly ContextType _context;
-    
+
     // ODataModelBuilder against which to construct the entity sets
     private ODataModelBuilder _builder;
 
@@ -38,9 +49,14 @@ namespace ODataAutoConfiguration
     /// and return the current instance of AutoScaffolder for chained calls
     /// </summary>
     /// <typeparam name="TEntity">The type of entity which the set comprises</typeparam>
-    public AutoScaffolder<ContextType> AddSetWithKeys<TEntity>() where TEntity : class, new()
+    public AutoScaffolder<ContextType> AddSetWithKeys<TEntity>(AutoScaffoldSettings settings) 
+      where TEntity : class, new()
     {
-      ConfigureSetWithKeys<TEntity>();
+      // Internal entity set configuration becomes unavailable. Primary keys must be configured by this call.
+      if (!settings.HasFlag(AutoScaffoldSettings.PrimaryKeys))
+        throw new ODataScaffoldException($"Method 'AddSetWithKeys' must be called with '{nameof(AutoScaffoldSettings.PrimaryKeys)}' flag present. To manually configure primary keys, call method 'ConfigureSetWithKeys'.");
+
+      ConfigureSetWithKeys<TEntity>(settings);
       
       return this;
     }
@@ -50,20 +66,46 @@ namespace ODataAutoConfiguration
     /// and return the EntitySetConfiguration`TEntity instance for additional customization
     /// </summary>
     /// <typeparam name="TEntity">The type of entity which the set comprises</typeparam>
-    public EntitySetConfiguration<TEntity> ConfigureSetWithKeys<TEntity>() where TEntity : class, new()
+    public EntitySetConfiguration<TEntity> ConfigureSetWithKeys<TEntity>(AutoScaffoldSettings settings) 
+      where TEntity : class, new()
     {
-      // Setup the set and entity configurations
+      // Get the name and context type of the entity set being configured
       string setName = _pluralizer.Pluralize(typeof(TEntity).Name);
+      IEntityType entityType = _context.Model.GetEntityTypes(typeof(TEntity)).SingleOrDefault<IEntityType>();
+
+
+      // Warn if the primary key setting was not specified or if the set will have no primary keys configured
+      // after execution is complete (these can still be applied manually after execution return so don't error-out)
+      Debug.WriteLineIf(!settings.HasFlag(AutoScaffoldSettings.PrimaryKeys), $"Set '{setName}`{typeof(TEntity).FullName}' will be scaffolded without {nameof(AutoScaffoldSettings.PrimaryKeys)} flag present (no primary keys will be configured)");
+      Debug.WriteLineIf(settings.HasFlag(AutoScaffoldSettings.PrimaryKeys) && (entityType.GetKeys() is null || !entityType.GetKeys().Any(key => key.IsPrimaryKey())), $"Set '{setName}`{typeof(TEntity).FullName}' will have no configured primary key.");
+
+
+      // Load configuration instances for entity set and type
       EntitySetConfiguration<TEntity> setConfig = _builder.EntitySet<TEntity>(setName);
       EntityTypeConfiguration<TEntity> entityConfig = setConfig.EntityType;
-
-      // Get the CrlType of the configuration
-      IEntityType entityType = _context.Model.GetEntityTypes(typeof(TEntity)).SingleOrDefault<IEntityType>();
     
-      // Check that the set will have a primary key
-      if (entityType.GetKeys() is null || !entityType.GetKeys().Any(key => key.IsPrimaryKey()))
-        throw new ODataScaffoldException($"Set '{setName}`{typeof(TEntity).FullName}' will have no configured primary key.");
 
+      // Handle configurations per the provided settings
+      if (settings.HasFlag(AutoScaffoldSettings.PrimaryKeys))
+        ScaffoldPrimaryKeys(entityConfig, entityType);
+        
+      if (settings.HasFlag(AutoScaffoldSettings.NavigationProperties))
+        ScaffoldNavigationProperties(entityConfig, entityType);
+        
+      if (settings.HasFlag(AutoScaffoldSettings.RequiredFields))
+        ScaffoldRequiredFields(entityConfig, entityType);
+        
+      if (settings.HasFlag(AutoScaffoldSettings.OptionalFields))
+        ScaffoldOptionalFields(entityConfig, entityType);
+
+
+      // Return the generic-typed set configuration instance
+      return setConfig;
+    }
+
+    private void ScaffoldPrimaryKeys<TEntity>(EntityTypeConfiguration<TEntity> entityConfig, IEntityType entityType)
+      where TEntity : class, new()
+    {
       // Build the properties belonging to the key (name and type)
       Dictionary<string, Type> keyProperties = new Dictionary<string, Type>();
       foreach (IKey entityKey in entityType.GetKeys().Where(key => key.Properties.Any()))
@@ -91,8 +133,99 @@ namespace ODataAutoConfiguration
       
       // Assign the key to the set configuration
       entityConfig.HasKey<object>(newKeyLambda);
+    }
 
-      return setConfig;
+    private void ScaffoldNavigationProperties<TEntity>(EntityTypeConfiguration<TEntity> entityConfig, IEntityType entityType)
+      where TEntity : class, new()
+    {
+      throw new NotImplementedException();
+    }
+
+    private void ScaffoldRequiredFields<TEntity>(EntityTypeConfiguration<TEntity> entityConfig, IEntityType entityType)
+      where TEntity : class, new()
+    {
+      // Create a parameter for the lambda entity
+      ParameterExpression entityParam = Expression.Parameter(typeof(TEntity), "entity");
+
+      // Load the set of non-nullable properties (required fields)
+      IEnumerable<IProperty> nullableProps = PropertyRetrieval(entityType, false);
+
+      foreach (IProperty entityProp in nullableProps)
+      {
+        MemberExpression optionalProperty = Expression.Property(entityParam, entityProp.Name);
+
+        if (entityProp.ClrType.IsValueType)
+        {
+          // The property is probably not convertible to an object, so reflect against a wrapper to retrieve the property configuration
+
+          // Load the generic method information
+          MethodInfo genericGetPrimative = GetPrimitivePropertyConfigurationMethod.MakeGenericMethod(new Type[] { typeof(TEntity), entityProp.ClrType });
+
+          // Execute the generic method to retrieve a PrimitivePropertyConfiguration instance
+          object primativeConfigObj = genericGetPrimative.Invoke(null, new object[] { entityConfig, entityParam, optionalProperty });
+          PrimitivePropertyConfiguration primativeConfig = (PrimitivePropertyConfiguration)primativeConfigObj;
+
+          // Apply the IsRequired method against the property configuration
+          primativeConfig.IsRequired();
+        }
+        else
+        {
+          // The property should be convertible to an object, so no reflection is needed
+          entityConfig.HasRequired(Expression.Lambda<Func<TEntity, object>>(optionalProperty, false, entityParam));
+        }
+      }
+    }
+
+    private void ScaffoldOptionalFields<TEntity>(EntityTypeConfiguration<TEntity> entityConfig, IEntityType entityType)
+      where TEntity : class, new()
+    {
+      // Create a parameter for the lambda entity
+      ParameterExpression entityParam = Expression.Parameter(typeof(TEntity), "entity");
+
+      // Load the set of nullable properties (optional fields)
+      IEnumerable<IProperty> optionalProps = PropertyRetrieval(entityType, true);
+
+      foreach (IProperty entityProp in optionalProps)
+      {
+        MemberExpression optionalProperty = Expression.Property(entityParam, entityProp.Name);
+
+        if (entityProp.ClrType.IsValueType)
+        {
+          // The property is probably not convertible to an object, so reflect against a wrapper to retrieve the property configuration
+
+          // Load the generic method information
+          MethodInfo genericGetPrimative = GetPrimitivePropertyConfigurationMethod.MakeGenericMethod(new Type[] { typeof(TEntity), entityProp.ClrType });
+
+          // Execute the generic method to retrieve a PrimitivePropertyConfiguration instance
+          object primativeConfigObj = genericGetPrimative.Invoke(null, new object[] { entityConfig, entityParam, optionalProperty });
+          PrimitivePropertyConfiguration primativeConfig = (PrimitivePropertyConfiguration)primativeConfigObj;
+
+          // Apply the IsOptional method against the property configuration
+          primativeConfig.IsOptional();
+        }
+        else
+        {
+          // The property should be convertible to an object, so no reflection is needed
+          entityConfig.HasOptional(Expression.Lambda<Func<TEntity, object>>(optionalProperty, false, entityParam));
+        }
+      }
+    }
+
+    private static IEnumerable<IProperty> PropertyRetrieval(IEntityType entityType, bool nullable)
+    {
+      IEnumerable<IProperty> properties = entityType.GetProperties();
+      return properties.Where(prop => nullable == prop.IsNullable);
+    }
+
+    private static PrimitivePropertyConfiguration GetPrimitivePropertyConfiguration<TEntity, TTarget>(
+      EntityTypeConfiguration<TEntity> entityConfig, 
+      ParameterExpression entityParam, 
+      MemberExpression optionalProperty
+    ) 
+      where TEntity : class, new()
+      where TTarget : struct
+    {
+      return entityConfig.Property(Expression.Lambda<Func<TEntity, TTarget>>(optionalProperty, false, entityParam));
     }
   }
 }
