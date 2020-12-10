@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
@@ -26,7 +27,8 @@ namespace ODataAutoConfiguration
     /// <summary>
     /// Create a dynamic Type instance, loaded in a dynamic assembly, which contains a 
     /// set of properties matching the provided IDictionary records. The type also contains
-    /// a generic and a full constructor for creating instances with all properties assigned.
+    /// a generic and a full constructor for creating instances with all properties assigned
+    /// <remarks>If there are no properties beloning to the object, no full constructor is generated.</remarks>
     /// </summary>
     /// <param name="properties"></param>
     /// <returns></returns>
@@ -38,12 +40,12 @@ namespace ODataAutoConfiguration
       MethodAttributes constructorAttributes = MA.Public | MA.SpecialName | MA.RTSpecialName;
 
       ConstructorBuilder genericConstructor = typeBuilder.DefineDefaultConstructor(constructorAttributes);
-      ConstructorBuilder fullConstructor = typeBuilder.DefineConstructor(constructorAttributes, CC.Standard, properties.Select(kvp => kvp.Value).ToArray());
-      
       // Generate IL for property getter/setter code
       List<FieldBuilder> objFields = new List<FieldBuilder>();
       foreach (KeyValuePair<string, Type> propertyInfo in properties)
         objFields.Add(GenerateProperty(typeBuilder, propertyInfo.Key, propertyInfo.Value));
+      
+      ConstructorBuilder fullConstructor = typeBuilder.DefineConstructor(constructorAttributes, CC.Standard, properties.Select(kvp => kvp.Value).ToArray());
       
       // Generate the IL for the full constructor after the getter/setter generation
       GenerateFullConstructor(typeBuilder, fullConstructor, objFields, properties);
@@ -105,11 +107,7 @@ namespace ODataAutoConfiguration
 
     private static void GenerateFullConstructor(TypeBuilder builder, ConstructorBuilder constructor, IList<FieldBuilder> fields, IDictionary<string, Type> properties)
     {
-      if (properties is null)
-        throw new ArgumentNullException(nameof(properties));
-
-      if (properties.Keys is null)
-        throw new ArgumentNullException(nameof(properties.Keys));
+      Debug.Assert(properties?.Keys is not null);
 
       if (properties.Keys.Count > (short.MaxValue / 3))
         throw new ArgumentOutOfRangeException(nameof(properties.Keys.Count));
